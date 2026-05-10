@@ -7,12 +7,37 @@ import { pool, minioClient, MINIO_BUCKET } from "./common.js";
 function setCORS(res: ServerResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-EduNex-User-Id");
 }
 
 function json(res: ServerResponse, status: number, data: unknown) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data));
+}
+
+function readHeaderValue(req: IncomingMessage, name: string): string | undefined {
+  const rawValue = req.headers[name.toLowerCase()];
+  if (Array.isArray(rawValue)) {
+    return rawValue[0]?.trim() || undefined;
+  }
+
+  return typeof rawValue === "string" && rawValue.trim() ? rawValue.trim() : undefined;
+}
+
+function resolveEduNexUserId(req: IncomingMessage, res: ServerResponse): number | null {
+  const rawUserId = readHeaderValue(req, "x-edunex-user-id");
+  if (!rawUserId) {
+    json(res, 401, { error: "missing x-edunex-user-id header" });
+    return null;
+  }
+
+  const userId = Number.parseInt(rawUserId, 10);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    json(res, 400, { error: "x-edunex-user-id must be a positive integer" });
+    return null;
+  }
+
+  return userId;
 }
 
 // ── 路由 ──
@@ -30,11 +55,10 @@ async function handler(req: IncomingMessage, res: ServerResponse) {
   const path = url.pathname;
 
   try {
-    // GET /knowledge?user_id=0  — 获取用户所有知识文档列表
+    // GET /knowledge — 获取当前 EduNex 用户的知识文档列表
     if (req.method === "GET" && path === "/knowledge") {
-      const userId = parseInt(url.searchParams.get("user_id") ?? "0", 10);
-      if (isNaN(userId)) {
-        json(res, 400, { error: "user_id must be an integer" });
+      const userId = resolveEduNexUserId(req, res);
+      if (userId === null) {
         return;
       }
       const { rows } = await pool.query(
@@ -49,13 +73,17 @@ async function handler(req: IncomingMessage, res: ServerResponse) {
       return;
     }
 
-    // GET /knowledge/:id — 获取单个知识文档详情
+    // GET /knowledge/:id — 获取当前 EduNex 用户可见的单个知识文档详情
     if (req.method === "GET" && /^\/knowledge\/\d+$/.test(path)) {
+      const userId = resolveEduNexUserId(req, res);
+      if (userId === null) {
+        return;
+      }
       const id = parseInt(path.split("/").pop()!, 10);
       const { rows } = await pool.query(
         `SELECT id, user_id, title, summary_md, source_files, tags, created_at
-         FROM PKM.knowledge_docs WHERE id = $1`,
-        [id],
+         FROM PKM.knowledge_docs WHERE id = $1 AND user_id = $2`,
+        [id, userId],
       );
       if (rows.length === 0) {
         json(res, 404, { error: `Doc id=${id} not found` });
@@ -70,11 +98,10 @@ async function handler(req: IncomingMessage, res: ServerResponse) {
       return;
     }
 
-    // GET /attachments?user_id=0 — 获取用户所有附件列表
+    // GET /attachments — 获取当前 EduNex 用户的附件列表
     if (req.method === "GET" && path === "/attachments") {
-      const userId = parseInt(url.searchParams.get("user_id") ?? "0", 10);
-      if (isNaN(userId)) {
-        json(res, 400, { error: "user_id must be an integer" });
+      const userId = resolveEduNexUserId(req, res);
+      if (userId === null) {
         return;
       }
       const { rows } = await pool.query(
@@ -99,13 +126,19 @@ async function handler(req: IncomingMessage, res: ServerResponse) {
       return;
     }
 
-    // GET /attachment/:id — 从 MinIO 下载附件文件
+    // GET /attachment/:id — 下载当前 EduNex 用户可见的附件文件
     if (req.method === "GET" && /^\/attachment\/\d+$/.test(path)) {
+      const userId = resolveEduNexUserId(req, res);
+      if (userId === null) {
+        return;
+      }
       const id = parseInt(path.split("/").pop()!, 10);
       const { rows } = await pool.query(
-        `SELECT id, doc_id, file_name, minio_key, content_type, file_size
-         FROM PKM.attachments WHERE id = $1`,
-        [id],
+        `SELECT a.id, a.doc_id, a.file_name, a.minio_key, a.content_type, a.file_size
+         FROM PKM.attachments a
+         JOIN PKM.knowledge_docs d ON d.id = a.doc_id
+         WHERE a.id = $1 AND d.user_id = $2`,
+        [id, userId],
       );
       if (rows.length === 0) {
         json(res, 404, { error: `Attachment id=${id} not found` });
